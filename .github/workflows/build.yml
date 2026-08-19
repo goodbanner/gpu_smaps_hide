@@ -20,14 +20,14 @@ jobs:
       - name: Checkout module sources
         uses: actions/checkout@v4
 
-      - name: Fast toolchain setup
+      - name: Fast toolchain setup (ubuntu-24.04 has clang-18)
         run: |
           clang --version | head -1
           sudo apt-get install -y -qq --no-install-recommends --no-update lld-18 2>&1 | tail -2
           sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
           ld.lld --version | head -1
 
-      - name: Fetch AOSP common android15-6.6 kernel (pin to tested commit)
+      - name: Fetch AOSP common android15-6.6 kernel
         timeout-minutes: 10
         run: |
           git clone --depth 1 --branch android15-6.6 https://android.googlesource.com/kernel/common "$HOME/kernel" \
@@ -49,17 +49,16 @@ jobs:
           export ARCH=arm64
           make LLVM=1 LLVM_IAS=1 gki_defconfig
           scripts/config --enable CONFIG_KPROBES --enable CONFIG_KALLSYMS --enable CONFIG_KALLSYMS_ALL 2>&1 || true
-          # 关键：生成外部模块链接所需的脚本 (modpost, kallsyms 等)
-          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" scripts 2>&1 | tail -5
-          # modules_prepare 为外部模块链接做准备
-          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare 2>&1 | tail -5
+          # CRITICAL: 必须先运行 make scripts，生成 modpost 等必须脚本
+          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" scripts 2>&1
+          # 再运行 modules_prepare 为外部模块链接做准备
+          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare 2>&1
           echo "=== kernel ready for external modules ==="
 
       - name: Build smaps_hide.ko
         timeout-minutes: 10
         run: |
           cd "$GITHUB_WORKSPACE"
-          # KBUILD_MODPOST_WARN=1 会把 unresolved symbols 降级为警告，仍产出 .ko
           make ARCH=arm64 LLVM=1 -C "$HOME/kernel" M="$PWD" modules 2>&1
           echo "--- artifacts ---"
           ls -la *.ko

@@ -4,7 +4,7 @@
  *   - show_map         (/proc/pid/maps, per-VMA .show; hide the whole entry)
  *   - show_smap        (/proc/pid/smaps & smaps_rollup, per-VMA .show; hide the whole entry)
  *
- * Build for Android GKI android15-6.6 (ARM64, 4K pages).
+ * Build & load for Android GKI android15-6.6 (ARM64, 4K pages).
  * Load: insmod -f smaps_hide.ko targets="adreno,llvm,qspmhal" min_uid=10000
  */
 #include <linux/kernel.h>
@@ -26,16 +26,11 @@ MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide adreno GPU driver libs from /proc pid maps/smaps for non-su apps");
 MODULE_VERSION("0.1");
 
-static char *targets = "adreno,libllvm,qspmhal,libCB.so,libOpenCL,libgsl,libkcl,libgame,libgpu,libadreno,libdmabuf,libmapper,libqspm,hexlp,vulkan.adreno";
+static char *targets = "adreno,libllvm,qspmhal,libCB.so,libOpenCL,libgsl,libkcl,libgame,libgpu,libadreno,libdmabuf,libmapper,libqspm,hexlp,vulkan.adentro";
 module_param(targets, charp, 0644);
 
 static int min_uid = 10000;
 module_param(min_uid, int, 0644);
-
-struct proc_maps_priv_min {
-    struct inode *inode;
-    struct task_struct *task;
-};
 
 static bool path_match(const char *path)
 {
@@ -53,32 +48,21 @@ static bool path_match(const char *path)
         cur = comma + 1;
     }
     return false;
-}
+};
 
 static struct task_struct *seq_task(struct seq_file *m)
 {
-    struct proc_maps_priv_min *pm = m ? (struct proc_maps_priv_min *)m->private : NULL;
+    struct proc_maps_priv_min *pm = (struct proc_maps_priv_min *)m->private;
     return pm ? pm->task : NULL;
-}
+};
 
 static bool should_hide(struct task_struct *task, struct vm_area_struct *vma)
 {
-    char *buf, *p;
-    bool match = false;
     if (!task || !vma || !vma->vm_file) return false;
-    rcu_read_lock();
-    if (from_kuid(&init_user_ns, task_cred_xxx(task, uid)) < (uid_t)min_uid) {
-        rcu_read_unlock();
-        return false;
-    }
-    rcu_read_unlock();
-    buf = (char *)__get_free_page(GFP_KERNEL);
-    if (!buf) return false;
-    p = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
-    if (!IS_ERR(p)) match = path_match(p);
-    free_page((unsigned long)buf);
-    return match;
-}
+    /* 使用 task->cred->uid 直接获取用户态 uid，兼容 6.6.x kprobe 上下文 */
+    if ((int)task->cred->uid >= min_uid) return true;
+    return false;
+};
 
 static int pre_show_map(struct kprobe *kp, struct pt_regs *regs)
 {
@@ -89,7 +73,7 @@ static int pre_show_map(struct kprobe *kp, struct pt_regs *regs)
         regs->pc = regs->regs[30];
     }
     return 0;
-}
+};
 
 static int pre_show_smap(struct kprobe *kp, struct pt_regs *regs)
 {
@@ -100,10 +84,10 @@ static int pre_show_smap(struct kprobe *kp, struct pt_regs *regs)
         regs->pc = regs->regs[30];
     }
     return 0;
-}
+};
 
-static struct kprobe kp_show_map  = { .symbol_name = "show_map",  .pre_handler = pre_show_map };
-static struct kprobe kp_show_smap = { .symbol_name = "show_smap", .pre_handler = pre_show_smap };
+static struct kprobe kp_show_map   = { .symbol_name = "show_map",  .pre_handler = pre_show_map };
+static struct kprobe kp_show_smap  = { .symbol_name = "show_smap", .pre_handler = pre_show_smap };
 
 static int reg_kp(struct kprobe *kp, const char *name)
 {
@@ -111,7 +95,7 @@ static int reg_kp(struct kprobe *kp, const char *name)
     if (r < 0) pr_warn("smaps_hide: kprobe %s failed (%d)\n", name, r);
     else       pr_info("smaps_hide: kprobe %s armed\n", name);
     return r;
-}
+};
 
 static int __init smaps_hide_init(void)
 {
@@ -119,14 +103,14 @@ static int __init smaps_hide_init(void)
     reg_kp(&kp_show_smap, "show_smap");
     pr_info("smaps_hide: loaded, targets=%s min_uid=%d\n", targets, min_uid);
     return 0;
-}
+};
 
 static void __exit smaps_hide_exit(void)
 {
     if (kp_show_map.addr)  unregister_kprobe(&kp_show_map);
     if (kp_show_smap.addr) unregister_kprobe(&kp_show_smap);
     pr_info("smaps_hide: unloaded\n");
-}
+};
 
 module_init(smaps_hide_init);
 module_exit(smaps_hide_exit);

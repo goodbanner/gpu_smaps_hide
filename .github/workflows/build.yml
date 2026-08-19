@@ -51,7 +51,7 @@ jobs:
           scripts/config --enable CONFIG_KPROBES --enable CONFIG_KALLSYMS --enable CONFIG_KALLSYMS_ALL 2>&1 || true
           # Build scripts (modpost, kallsyms, etc.) needed for external module final link
           make LLVM=1 LLVM_IAS=1 -j"$(nproc)" scripts 2>&1 | tail -5
-          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare 2>&1 | tail-5
+          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare 2>&1 | tail -5
           echo "=== kernel ready for external modules ==="
 
       - name: Build smaps_hide.ko

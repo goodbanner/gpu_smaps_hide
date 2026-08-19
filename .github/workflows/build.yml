@@ -13,21 +13,23 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout module sources
         uses: actions/checkout@v4
 
-      - name: Fast toolchain setup (ubuntu-24.04 has clang-18, add lld-18)
+      - name: Fast toolchain setup (ubuntu-24.04 has clang-18, only add missing lld-18)
         run: |
           clang --version | head -1
-          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends \
-            lld-18 llvm-18-tools \
-            make flex bison bc libssl-dev libelf-dev dwarves rsync cpio python3 2>&1 | tail -3
-          # symlink lld-18 -> ld.lld
+          # Check what's already installed
+          dpkg -l make flex bison bc libssl-dev libelf-dev dwarves rsync cpio python3 2>/dev/null | grep ^ii | wc -l
+          # Install ONLY lld-18 (ld.lld) with minimal overhead
+          sudo apt-get install -y -qq --no-install-recommends --no-update lld-18 2>&1 | tail -2
           sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
           ld.lld --version | head -1
 
       - name: Fetch AOSP common android15-6.6 kernel
+        timeout-minutes: 10
         run: |
           git clone --depth 1 --branch android15-6.6 https://android.googlesource.com/kernel/common "$HOME/kernel" \
             || git clone https://android.googlesource.com/kernel/common "$HOME/kernel"
@@ -42,6 +44,7 @@ jobs:
           echo "KERNEL_COMMIT=$(git rev-parse HEAD)"
 
       - name: Prepare kernel (gki_defconfig + modules_prepare)
+        timeout-minutes: 10
         run: |
           cd "$HOME/kernel"
           export ARCH=arm64
@@ -50,6 +53,7 @@ jobs:
           make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare 2>&1 | tail -5
 
       - name: Build smaps_hide.ko
+        timeout-minutes: 10
         run: |
           cd "$GITHUB_WORKSPACE"
           make ARCH=arm64 LLVM=1 KBUILD_MODPOST_WARN=1 -C "$HOME/kernel" M="$PWD" modules 2>&1 | tail -30

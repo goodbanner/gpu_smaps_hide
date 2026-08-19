@@ -16,11 +16,7 @@
 #include <linux/fs.h>
 #include <linux/dcache.h>
 #include <linux/path.h>
-#include <linux/cred.h>
-#include <linux/rcupdate.h>
-#include <linux/sched.h>
-#include <linux/uidgid.h>
-#include <linux/user_namespace.h>
+#include <linux/module.h>
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide adreno GPU driver libs from /proc pid maps/smaps for non-su apps");
@@ -32,6 +28,7 @@ module_param(targets, charp, 0644);
 static int min_uid = 10000;
 module_param(min_uid, int, 0644);
 
+/* 路径子串匹配 - 仅匹配目标库路径的子串 */
 static bool path_match(const char *path)
 {
     char *cur = targets;
@@ -50,42 +47,39 @@ static bool path_match(const char *path)
     return false;
 };
 
-static struct task_struct *seq_task(struct seq_file *m)
-{
-    struct proc_maps_priv_min *pm = (struct proc_maps_priv_min *)m->private;
-    return pm ? pm->task : NULL;
-};
-
-static bool should_hide(struct task_struct *task, struct vm_area_struct *vma)
-{
-    if (!task || !vma || !vma->vm_file) return false;
-    /* 使用 task->cred->uid 直接获取用户态 uid，兼容 6.6.x kprobe 上下文 */
-    if ((int)task->cred->uid >= min_uid) return true;
-    return false;
-};
-
+/* show_map 钩子 - 隐藏 /proc/pid/maps 中的整条目 */
 static int pre_show_map(struct kprobe *kp, struct pt_regs *regs)
 {
     struct seq_file *m = (struct seq_file *)regs->regs[0];
     struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
-    if (m && vma && should_hide(seq_task(m), vma)) {
-        regs->regs[0] = 0;
-        regs->pc = regs->regs[30];
+    if (m && vma) {
+        char buf[PAGE_SIZE];
+        char *path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
+        if (!ISERT(path) && path_match(path)) {
+            regs->regs[0] = 0;
+            regs->pc = regs->regs[30];
+        }
     }
     return 0;
 };
 
+/* show_smap 钩子 - 隐藏 /proc/pid/smaps 和 smaps_rollup 中的整条目 */
 static int pre_show_smap(struct kprobe *kp, struct pt_regs *regs)
 {
     struct seq_file *m = (struct seq_file *)regs->regs[0];
     struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
-    if (m && vma && should_hide(seq_task(m), vma)) {
-        regs->regs[0] = 0;
-        regs->pc = regs->regs[30];
+    if (m && vma) {
+        char buf[PAGE_SIZE];
+        char *path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
+        if (!ISERT(path) && path_match(path)) {
+            regs->regs[0] = 0;
+            regs->pc = regs->regs[30];
+        }
     }
     return 0;
 };
 
+/* kprobe 注册 */
 static struct kprobe kp_show_map   = { .symbol_name = "show_map",  .pre_handler = pre_show_map };
 static struct kprobe kp_show_smap  = { .symbol_name = "show_smap", .pre_handler = pre_show_smap };
 
@@ -101,7 +95,7 @@ static int __init smaps_hide_init(void)
 {
     reg_kp(&kp_show_map,  "show_map");
     reg_kp(&kp_show_smap, "show_smap");
-    pr_info("smaps_hide: loaded, targets=%s min_uid=%d\n", targets, min_uid);
+    pr_info("smaps_hide: loaded\n");
     return 0;
 };
 

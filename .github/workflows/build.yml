@@ -20,13 +20,23 @@ jobs:
       - name: Checkout module sources
         uses: actions/checkout@v4
 
-      - name: Fast toolchain setup (ubuntu-24.04 has clang-18)
+      - name: Setup toolchain (install llvm-18-tools)
         run: |
-          clang --version | head -1
-          # 安装 llvm-18-tools 提供 llvm-readelf, llvm-nm, llvm-objcopy
-          sudo apt-get install -y -qq --no-install-recommends llvm-18-tools 2>&1 | tail -2
-          sudo apt-get install -y -qq --no-install-recommends lld-18 2>&1 | tail -2
+          # 1. 更新包列表（必须，否则安装旧版本或失败）
+          sudo apt-get update -qq
+          # 2. 安装完整工具链：clang-18, lld-18, llvm-18-tools (含 readelf/nm/objcopy)
+          sudo apt-get install -y -qq clang-18 lld-18 llvm-18-tools 2>&1 | tail -5
+          # 验证关键工具
+          which llvm-readelf-18 llvm-nm-18 llvm-objcopy-18 ld.lld-18
+          # 创建无版本号软链接供内核构建系统使用
+          sudo ln -sf "$(command -v llvm-readelf-18)" /usr/local/bin/llvm-readelf
+          sudo ln -sf "$(command -v llvm-nm-18)" /usr/local/bin/llvm-nm
+          sudo ln -sf "$(command -v llvm-objcopy-18)" /usr/local/bin/llvm-objcopy
           sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
+          # 验证无版本号命令可用
+          llvm-readelf --version | head -1
+          llvm-nm --version | head -1
+          llvm-objcopy --version | head -1
           ld.lld --version | head -1
 
       - name: Fetch AOSP common android15-6.6 kernel
@@ -51,7 +61,7 @@ jobs:
           export ARCH=arm64
           make LLVM=1 LLVM_IAS=1 gki_defconfig
           scripts/config --enable CONFIG_KPROBES --enable CONFIG_KALLSYMS --enable CONFIG_KALLSYMS_ALL 2>&1 || true
-          # CRITICAL: 必须先运行 make scripts，生成 modpost 等必须脚本
+          # 必须先运行 make scripts，生成 modpost 等必须脚本
           make LLVM=1 LLVM_IAS=1 -j"$(nproc)" scripts 2>&1
           # 再运行 modules_prepare 为外部模块链接做准备
           make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare 2>&1

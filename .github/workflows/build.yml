@@ -17,16 +17,14 @@ jobs:
       - name: Checkout module sources
         uses: actions/checkout@v4
 
-      - name: Install clang-18 + kernel build deps
+      - name: Fast toolchain setup (ubuntu-24.04 already has clang-18)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-18 lld-18 llvm-18 llvm-18-tools \
-            make flex bison bc libssl-dev libelf-dev dwarves rsync cpio python3
-          for t in clang clang++ llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf \
-                    llvm-strip ld.lld clang-cpp llvm-as llvm-ranlib llvm-size; do
-            if command -v "$t-18" >/dev/null 2>&1; then sudo ln -sf "$(command -v "$t-18")" /usr/local/bin/$t; fi
-          done
+          # ubuntu-24.04 noble ships clang-18 / lld-18 by default
           clang --version | head -1
+          ld.lld --version | head -1
+          # only install tiny missing bits
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends \
+            make flex bison bc libssl-dev libelf-dev dwarves rsync cpio python3 2>&1 | tail -3
 
       - name: Fetch AOSP common android15-6.6 kernel
         run: |
@@ -53,8 +51,6 @@ jobs:
       - name: Build smaps_hide.ko
         run: |
           cd "$GITHUB_WORKSPACE"
-          # No Module.symvers needed: device kernel tolerates modversion drift,
-          # so unresolved-symbol checks are downgraded to warnings.
           make ARCH=arm64 LLVM=1 KBUILD_MODPOST_WARN=1 -C "$HOME/kernel" M="$PWD" modules 2>&1 | tail -30
           echo "--- artifacts ---"
           ls -la *.ko

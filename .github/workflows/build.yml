@@ -20,24 +20,14 @@ jobs:
       - name: Checkout module sources
         uses: actions/checkout@v4
 
-      - name: Setup toolchain (install llvm-18-tools)
+      - name: Fast toolchain setup (ubuntu-24.04 has clang-18)
         run: |
-          # 1. 更新包列表（必须，否则安装旧版本或失败）
-          sudo apt-get update -qq
-          # 2. 安装完整工具链：clang-18, lld-18, llvm-18-tools (含 readelf/nm/objcopy)
-          sudo apt-get install -y -qq clang-18 lld-18 llvm-18-tools 2>&1 | tail -5
-          # 验证关键工具
-          which llvm-readelf-18 llvm-nm-18 llvm-objcopy-18 ld.lld-18
-          # 创建无版本号软链接供内核构建系统使用
-          sudo ln -sf "$(command -v llvm-readelf-18)" /usr/local/bin/llvm-readelf
-          sudo ln -sf "$(command -v llvm-nm-18)" /usr/local/bin/llvm-nm
-          sudo ln -sf "$(command -v llvm-objcopy-18)" /usr/local/bin/llvm-objcopy
+          clang --version | head -1
+          sudo apt-get install -y -qq --no-install-recommends llvm-18-tools 2>/dev/null | tail -2
+          sudo apt-get install -y -qq --no-install-recommends lld-18 2>/dev/null | tail -2
           sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
-          # 验证无版本号命令可用
-          llvm-readelf --version | head -1
-          llvm-nm --version | head -1
-          llvm-objcopy --version | head -1
           ld.lld --version | head -1
+          export CC=clang-18   # 【关键】显式指定 clang-18，锁定 GKI 6.6 编译环境
 
       - name: Fetch AOSP common android15-6.6 kernel
         timeout-minutes: 10
@@ -60,18 +50,16 @@ jobs:
           cd "$HOME/kernel"
           export ARCH=arm64
           make LLVM=1 LLVM_IAS=1 gki_defconfig
-          scripts/config --enable CONFIG_KPROBES --enable CONFIG_KALLSYMS --enable CONFIG_KALLSYMS_ALL 2>&1 || true
-          # 必须先运行 make scripts，生成 modpost 等必须脚本
-          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" scripts 2>&1
-          # 再运行 modules_prepare 为外部模块链接做准备
-          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare 2>&1
+          scripts/config --enable CONFIG_KPROBES --enable CONFIG_KALLSYMS --enable CONFIG_KALLSYMS_ALL 2>/dev/null || true
+          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" scripts 2>/dev/null
+          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare 2>/dev/null
           echo "=== kernel ready for external modules ==="
 
       - name: Build smaps_hide.ko
         timeout-minutes: 10
         run: |
           cd "$GITHUB_WORKSPACE"
-          make ARCH=arm64 LLVM=1 -C "$HOME/kernel" M="$PWD" modules 2>&1
+          make ARCH=arm64 LLVM=1 -C "$HOME/kernel" M="$PWD" modules 2>/dev/null
           echo "--- artifacts ---"
           ls -la *.ko
           strings smaps_hide.ko | grep -m1 vermagic || true

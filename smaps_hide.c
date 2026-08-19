@@ -5,7 +5,7 @@
  *   - show_smap        (/proc/pid/smaps & smaps_rollup, per-VMA .show; hide the whole entry)
  *
  * Build & load for Android GKI android15-6.6 (ARM64, 4K pages).
- * Load: insmod -f smaps_hide.ko targets="adreno,llvm,qspmhal" min_uid=10000
+ * Load: insmod -f smaps_hide.ko targets="adreno,libllvm,qspmhal" min_uid=10000
  */
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -17,6 +17,8 @@
 #include <linux/dcache.h>
 #include <linux/path.h>
 #include <linux/module.h>
+#include <linux/gfp.h>
+#include <linux/slab.h>
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide adreno GPU driver libs from /proc pid maps/smaps for non-su apps");
@@ -47,18 +49,32 @@ static bool path_match(const char *path)
     return false;
 };
 
+/* 通用隐藏逻辑：分配页缓冲 -> d_path -> 匹配 -> 隐藏 */
+static int hide_if_match(struct seq_file *m, struct vm_area_struct *vma)
+{
+    if (!m || !vma || !vma->vm_file) return 0;
+
+    unsigned long page = __get_free_page(GFP_ATOMIC);
+    if (!page) return 0;
+
+    char *buf = (char *)page;
+    char *path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
+    bool match = !IS_ERR(path) && path_match(path);
+
+    free_page(page);
+
+    if (match) return 1;
+    return 0;
+};
+
 /* show_map 钩子 - 隐藏 /proc/pid/maps 中的整条目 */
 static int pre_show_map(struct kprobe *kp, struct pt_regs *regs)
 {
     struct seq_file *m = (struct seq_file *)regs->regs[0];
     struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
-    if (m && vma) {
-        char buf[PAGE_SIZE];
-        char *path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
-        if (!IS_ERR(path) && path_match(path)) {  // 修正：IS_ERR
-            regs->regs[0] = 0;
-            regs->pc = regs->regs[30];
-        }
+    if (hide_if_match(m, vma)) {
+        regs->regs[0] = 0;
+        regs->pc = regs->regs[30];
     }
     return 0;
 };
@@ -68,13 +84,9 @@ static int pre_show_smap(struct kprobe *kp, struct pt_regs *regs)
 {
     struct seq_file *m = (struct seq_file *)regs->regs[0];
     struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
-    if (m && vma) {
-        char buf[PAGE_SIZE];
-        char *path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
-        if (!IS_ERR(path) && path_match(path)) {  // 修正：IS_ERR
-            regs->regs[0] = 0;
-            regs->pc = regs->regs[30];
-        }
+    if (hide_if_match(m, vma)) {
+        regs->regs[0] = 0;
+        regs->pc = regs->regs[30];
     }
     return 0;
 };

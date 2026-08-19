@@ -17,14 +17,15 @@ jobs:
       - name: Checkout module sources
         uses: actions/checkout@v4
 
-      - name: Fast toolchain setup (ubuntu-24.04 already has clang-18)
+      - name: Fast toolchain setup (ubuntu-24.04 has clang-18, add lld-18)
         run: |
-          # ubuntu-24.04 noble ships clang-18 / lld-18 by default
           clang --version | head -1
-          ld.lld --version | head -1
-          # only install tiny missing bits
           sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends \
+            lld-18 llvm-18-tools \
             make flex bison bc libssl-dev libelf-dev dwarves rsync cpio python3 2>&1 | tail -3
+          # symlink lld-18 -> ld.lld
+          sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
+          ld.lld --version | head -1
 
       - name: Fetch AOSP common android15-6.6 kernel
         run: |

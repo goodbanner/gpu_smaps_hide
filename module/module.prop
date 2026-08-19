@@ -1,1 +1,6 @@
-
+id=smaps_hide
+name=SmapsHide (kprobe kernel module)
+version=v0.1
+versionCode=1
+author=github-actions
+description=Hides adreno GPU driver libs from /proc/pid/{maps,smaps,smaps_rollup} for uid>=10000 apps. Insmod smaps_hide.ko via kprobes.

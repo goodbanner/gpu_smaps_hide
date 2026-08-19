@@ -55,7 +55,7 @@ static int pre_show_map(struct kprobe *kp, struct pt_regs *regs)
     if (m && vma) {
         char buf[PAGE_SIZE];
         char *path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
-        if (!ISERT(path) && path_match(path)) {
+        if (!IS_ERR(path) && path_match(path)) {  // 修正：IS_ERR
             regs->regs[0] = 0;
             regs->pc = regs->regs[30];
         }
@@ -71,7 +71,7 @@ static int pre_show_smap(struct kprobe *kp, struct pt_regs *regs)
     if (m && vma) {
         char buf[PAGE_SIZE];
         char *path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
-        if (!ISERT(path) && path_match(path)) {
+        if (!IS_ERR(path) && path_match(path)) {  // 修正：IS_ERR
             regs->regs[0] = 0;
             regs->pc = regs->regs[30];
         }

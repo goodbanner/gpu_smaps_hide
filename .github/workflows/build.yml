@@ -23,8 +23,9 @@ jobs:
       - name: Fast toolchain setup (ubuntu-24.04 has clang-18)
         run: |
           clang --version | head -1
-          # 安装 llvm-18-tools 包含 llvm-readelf, llvm-nm, llvm-objcopy 等
+          # 安装 llvm-18-tools 提供 llvm-readelf, llvm-nm, llvm-objcopy
           sudo apt-get install -y -qq --no-install-recommends llvm-18-tools 2>&1 | tail -2
+          sudo apt-get install -y -qq --no-install-recommends lld-18 2>&1 | tail -2
           sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
           ld.lld --version | head -1
 

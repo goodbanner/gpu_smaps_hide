@@ -10,6 +10,7 @@ on:
     paths:
       - 'smaps_hide.c'
       - 'Kbuild'
+      - 'running.config'
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -33,58 +34,68 @@ jobs:
           sudo ln -sf /usr/lib/llvm-18/bin/ld.lld /usr/local/bin/ld.lld
           clang --version | head -1; ld.lld --version | head -1
 
-      - name: Fetch AOSP common android15-6.6 kernel
-        timeout-minutes: 10
+      # 必须构建在与设备一致的内核源码 commit 上，否则 task_struct / pt_regs /
+      # kretprobe_instance 等结构体布局不同，kretprobe 处理函数会解引用错误地址
+      # 导致 insmod -f 后瞬间 panic / 重启。
+      - name: Fetch AOSP common android15-6.6 kernel at exact device commit
+        timeout-minutes: 15
         run: |
-          git clone --depth 1 --branch android15-6.6 --filter=blob:none \
-            https://android.googlesource.com/kernel/common "$HOME/kernel" \
-            || git clone --depth 1 --filter=blob:none \
+          git clone --filter=blob:none --no-checkout \
             https://android.googlesource.com/kernel/common "$HOME/kernel"
           cd "$HOME/kernel"
           SHA="${{ github.event.inputs.kernel_sha || '004a97f76e10' }}"
-          if [ -n "$SHA" ] && ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
-            git fetch --depth 1 origin "$SHA" 2>/dev/null || true
+          # 拉取目标 commit（即便它不是分支 tip，Googlesource 也允许按 SHA 取）
+          git fetch --tags origin "$SHA" 2>/dev/null || git fetch origin "$SHA"
+          git checkout -q "$SHA"
+          # 校验：必须真的停在目标 commit，否则直接失败（不要再静默落到分支 tip）
+          ACTUAL="$(git rev-parse HEAD)"
+          echo "KERNEL_COMMIT=$ACTUAL"
+          if [ "$ACTUAL" != "$SHA" ]; then
+            echo "ERROR: checked out $ACTUAL, expected $SHA"
+            exit 1
           fi
-          if [ -n "$SHA" ] && git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
-            git checkout -q "$SHA"
-          fi
-          echo "KERNEL_COMMIT=$(git rev-parse HEAD)"
 
-      - name: Prepare kernel (GKI build config, gki_defconfig fallback)
+      # 用设备真实 config（running.config，来自 /proc/config.gz）而非 gki_defconfig，
+      # 否则缺 PTR_AUTH_KERNEL / SHADOW_CALL_STACK / KASAN_HW_TAGS / 全抢占等开关，
+      # 结构体布局与运行内核不符。
+      - name: Prepare kernel tree with device real config
         timeout-minutes: 15
         run: |
           cd "$HOME/kernel"
           export ARCH=arm64
           export OUT_DIR="$HOME/kernel/out"
-          # 优先用 AOSP 官方 GKI build config，生成与设备一致的 .config / ksyms 白名单
-          if [ -x build/build.sh ] && [ -f common/build.config.gki.aarch64 ]; then
-            LLVM=1 LLVM_IAS=1 OUT_DIR="$OUT_DIR" \
-              BUILD_CONFIG=common/build.config.gki.aarch64 SKIP_KERNEL_BUILD=1 \
-              ./build/build.sh 2>&1
-          else
-            echo "build.sh / GKI config not found, falling back to gki_defconfig"
-            make LLVM=1 LLVM_IAS=1 gki_defconfig
-            scripts/config --enable CONFIG_KPROBES --enable CONFIG_KALLSYMS --enable CONFIG_KALLSYMS_ALL 2>&1 || true
-            # CRITICAL: 必须先运行 make scripts，生成 modpost 等必须脚本
-            make LLVM=1 LLVM_IAS=1 -j"$(nproc)" scripts 2>&1
-            # 再运行 modules_prepare 为外部模块链接做准备
-            make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare 2>&1
+          mkdir -p "$OUT_DIR"
+          if [ ! -f "$GITHUB_WORKSPACE/running.config" ]; then
+            echo "ERROR: running.config missing from repo root; capture it via 'adb shell zcat /proc/config.gz > running.config'"
+            exit 1
           fi
+          cp "$GITHUB_WORKSPACE/running.config" "$OUT_DIR/.config"
+          make O="$OUT_DIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          # 外部模块必需：生成 modpost 脚本与内核头文件
+          make O="$OUT_DIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare
           echo "=== kernel ready for external modules ==="
-          ls -l "$OUT_DIR/.config" 2>/dev/null || ls -l .config
+          ls -l "$OUT_DIR/.config"
 
       - name: Build smaps_hide.ko
         timeout-minutes: 10
         run: |
           cd "$GITHUB_WORKSPACE"
           KOUT="$HOME/kernel/out"
-          # 若 GKI build.sh 未产出 out/ 树，则回退到内核源码树内编译
-          [ -f "$KOUT/.config" ] || KOUT="$HOME/kernel"
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 \
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             -C "$HOME/kernel" O="$KOUT" M="$PWD" modules 2>&1
           echo "--- artifacts ---"
           ls -la *.ko
-          strings smaps_hide.ko | grep -m1 vermagic || true
+
+      - name: Verify vermagic matches device kernel
+        run: |
+          KO="$GITHUB_WORKSPACE/smaps_hide.ko"
+          VM="$(readelf -p .modinfo "$KO" 2>/dev/null | grep -i vermagic | sed 's/.*vermagic=//;s/ .*//')"
+          echo "Module vermagic: $VM"
+          echo "Expected prefix: 6.6.147-android15-8-g004a97f76e10"
+          case "$VM" in
+            *004a97f76e10*) echo "OK: vermagic matches device commit" ;;
+            *) echo "WARNING: vermagic does NOT contain 004a97f76e10; do NOT load this .ko"; exit 1 ;;
+          esac
 
       - name: Upload artifacts
         if: success()

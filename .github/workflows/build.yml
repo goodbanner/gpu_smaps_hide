@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_sha:
-        description: 'AOSP common kernel android15-6.6 commit SHA (leave default to match your device)'
+        description: 'Kernel source commit SHA. Default 004a97f76e10 is verified against this device (/proc/version: 6.6.147-android15-8-g004a97f76e10-...-4k). Leave default to match device.'
         required: false
         default: '004a97f76e10'
   push:
@@ -19,25 +19,27 @@ jobs:
     steps:
       - name: Checkout module sources
         uses: actions/checkout@v4
-        
-      - name: Fast toolchain setup (ubuntu-24.04 has clang-18)
+
+      - name: Fast toolchain setup (ubuntu-24.04)
         run: |
           clang --version | head -1
-          sudo apt-get update -y 2>/dev/null | tail -1
-          sudo apt-get install -y -qq --no-install-recommends clang-18 lld-18 2>/dev/null | tail -2
-          # 【关键】创建 llvm 工具软链接，解决 make 找不到 llvm-readelf/llvm-nm/llvm-objcopy 的问题
-          sudo ln -sf /usr/bin/llvm-readelf-18 /usr/bin/llvm-readelf
-          sudo ln -sf /usr/bin/llvm-nm-18 /usr/bin/llvm-nm
-          sudo ln -sf /usr/bin/llvm-objcopy-18 /usr/bin/llvm-objcopy
-          sudo ln -sf /usr/bin/ld.lld-18 /usr/local/bin/ld.lld
-          ld.lld --version | head -1
-          export CC=clang-18   # 【关键】明确指定 clang-18，防止 make 使用系统默认旧版 clang
-         
-      - name: Fetch AOSP common android15-6.6 kernel (匹配你的设备内核)
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            llvm-18 lld-18 flex bison bc libelf-dev libssl-dev
+          # LLVM=1 需要无后缀的 llvm-* 工具（llvm-18-tools 只提供带 -18 后缀的）
+          for t in ar nm objcopy objdump readelf strip as; do
+            sudo ln -sf /usr/lib/llvm-18/bin/llvm-$t /usr/local/bin/llvm-$t
+          done
+          sudo ln -sf /usr/lib/llvm-18/bin/ld.lld /usr/local/bin/ld.lld
+          clang --version | head -1; ld.lld --version | head -1
+
+      - name: Fetch AOSP common android15-6.6 kernel
         timeout-minutes: 10
         run: |
-          git clone --depth 1 --branch android15-6.6 https://android.googlesource.com/kernel/common "$HOME/kernel" \
-            || git clone https://android.googlesource.com/kernel/common "$HOME/kernel"
+          git clone --depth 1 --branch android15-6.6 --filter=blob:none \
+            https://android.googlesource.com/kernel/common "$HOME/kernel" \
+            || git clone --depth 1 --filter=blob:none \
+            https://android.googlesource.com/kernel/common "$HOME/kernel"
           cd "$HOME/kernel"
           SHA="${{ github.event.inputs.kernel_sha || '004a97f76e10' }}"
           if [ -n "$SHA" ] && ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
@@ -47,29 +49,43 @@ jobs:
             git checkout -q "$SHA"
           fi
           echo "KERNEL_COMMIT=$(git rev-parse HEAD)"
-         
-      - name: Prepare kernel (defconfig + scripts + modules_prepare)  ← 【关键修复点】
+
+      - name: Prepare kernel (GKI build config, gki_defconfig fallback)
         timeout-minutes: 15
         run: |
           cd "$HOME/kernel"
           export ARCH=arm64
-          # 1. 加载 GKI 默认配置（确保 CONFIG_KPROBES 等符号存在）
-          make LLVM=1 LLVM_IAS=1 gki_defconfig
-          # 2. 【必跑】显式生成 scripts 所需的头文件和 make 依赖（此步常被 cache 做标记从而导致 exit code 2）
-          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" scripts
-          # 3. 为外部模块链接做准备（必须在 scripts 之后）
-          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare
+          export OUT_DIR="$HOME/kernel/out"
+          # 优先用 AOSP 官方 GKI build config，生成与设备一致的 .config / ksyms 白名单
+          if [ -x build/build.sh ] && [ -f common/build.config.gki.aarch64 ]; then
+            LLVM=1 LLVM_IAS=1 OUT_DIR="$OUT_DIR" \
+              BUILD_CONFIG=common/build.config.gki.aarch64 SKIP_KERNEL_BUILD=1 \
+              ./build/build.sh 2>&1
+          else
+            echo "build.sh / GKI config not found, falling back to gki_defconfig"
+            make LLVM=1 LLVM_IAS=1 gki_defconfig
+            scripts/config --enable CONFIG_KPROBES --enable CONFIG_KALLSYMS --enable CONFIG_KALLSYMS_ALL 2>&1 || true
+            # CRITICAL: 必须先运行 make scripts，生成 modpost 等必须脚本
+            make LLVM=1 LLVM_IAS=1 -j"$(nproc)" scripts 2>&1
+            # 再运行 modules_prepare 为外部模块链接做准备
+            make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare 2>&1
+          fi
           echo "=== kernel ready for external modules ==="
-         
+          ls -l "$OUT_DIR/.config" 2>/dev/null || ls -l .config
+
       - name: Build smaps_hide.ko
         timeout-minutes: 10
         run: |
           cd "$GITHUB_WORKSPACE"
-          make ARCH=arm64 LLVM=1 -C "$HOME/kernel" M="$PWD" modules
+          KOUT="$HOME/kernel/out"
+          # 若 GKI build.sh 未产出 out/ 树，则回退到内核源码树内编译
+          [ -f "$KOUT/.config" ] || KOUT="$HOME/kernel"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 \
+            -C "$HOME/kernel" O="$KOUT" M="$PWD" modules 2>&1
           echo "--- artifacts ---"
           ls -la *.ko
           strings smaps_hide.ko | grep -m1 vermagic || true
-         
+
       - name: Upload artifacts
         if: success()
         uses: actions/upload-artifact@v4

@@ -19,15 +19,20 @@ jobs:
     steps:
       - name: Checkout module sources
         uses: actions/checkout@v4
-
+        
       - name: Fast toolchain setup (ubuntu-24.04 has clang-18)
         run: |
           clang --version | head -1
-          sudo apt-get install -y -qq --no-install-recommends llvm-18-tools lld-18 2>/dev/null | tail -2
-          sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
+          sudo apt-get update -y 2>/dev/null | tail -1
+          sudo apt-get install -y -qq --no-install-recommends clang-18 lld-18 2>/dev/null | tail -2
+          # 【关键】创建 llvm 工具软链接，解决 make 找不到 llvm-readelf/llvm-nm/llvm-objcopy 的问题
+          sudo ln -sf /usr/bin/llvm-readelf-18 /usr/bin/llvm-readelf
+          sudo ln -sf /usr/bin/llvm-nm-18 /usr/bin/llvm-nm
+          sudo ln -sf /usr/bin/llvm-objcopy-18 /usr/bin/llvm-objcopy
+          sudo ln -sf /usr/bin/ld.lld-18 /usr/local/bin/ld.lld
           ld.lld --version | head -1
           export CC=clang-18   # 【关键】明确指定 clang-18，防止 make 使用系统默认旧版 clang
-
+         
       - name: Fetch AOSP common android15-6.6 kernel (匹配你的设备内核)
         timeout-minutes: 10
         run: |
@@ -35,7 +40,6 @@ jobs:
             || git clone https://android.googlesource.com/kernel/common "$HOME/kernel"
           cd "$HOME/kernel"
           SHA="${{ github.event.inputs.kernel_sha || '004a97f76e10' }}"
-          # 仅当提供了有效 SHA 且仓库不包含该提交时才尝试拉取
           if [ -n "$SHA" ] && ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
             git fetch --depth 1 origin "$SHA" 2>/dev/null || true
           fi
@@ -43,7 +47,7 @@ jobs:
             git checkout -q "$SHA"
           fi
           echo "KERNEL_COMMIT=$(git rev-parse HEAD)"
-
+         
       - name: Prepare kernel (defconfig + scripts + modules_prepare)  ← 【关键修复点】
         timeout-minutes: 15
         run: |
@@ -56,7 +60,7 @@ jobs:
           # 3. 为外部模块链接做准备（必须在 scripts 之后）
           make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare
           echo "=== kernel ready for external modules ==="
-
+         
       - name: Build smaps_hide.ko
         timeout-minutes: 10
         run: |
@@ -65,7 +69,7 @@ jobs:
           echo "--- artifacts ---"
           ls -la *.ko
           strings smaps_hide.ko | grep -m1 vermagic || true
-
+         
       - name: Upload artifacts
         if: success()
         uses: actions/upload-artifact@v4

@@ -37,13 +37,14 @@ jobs:
       # 公共 AOSP common GKI android15-6.6。GKI 保证核心结构体布局在 6.6 代次内
       # ABI 稳定，故无需 pin 到设备私有提交 004a97f76e10（OnePlus 尚未开源该版）。
       # 只有运行内核的“真实 config”（running.config）才决定 task_struct/pt_regs 布局。
+      # 用 --depth 1 只取一个提交（外部模块构建不需要历史），让 clone 直接检出顶端。
       - name: Fetch AOSP common GKI android15-6.6 kernel
         timeout-minutes: 20
         run: |
-          git clone --filter=blob:none --branch "${{ github.event.inputs.kernel_ref || 'android15-6.6' }}" --no-checkout \
+          git clone --filter=blob:none --depth 1 \
+            --branch "${{ github.event.inputs.kernel_ref || 'android15-6.6' }}" \
             https://android.googlesource.com/kernel/common "$HOME/kernel"
           cd "$HOME/kernel"
-          git checkout -q FETCH_HEAD
           echo "KERNEL_COMMIT=$(git rev-parse HEAD)"
           echo "KERNEL_VERSION=$(make -s kernelversion 2>/dev/null || true)"
 

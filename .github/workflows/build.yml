@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_sha:
-        description: 'AOSP common kernel android15-6.6 commit SHA (leave default)'
+        description: 'AOSP common kernel android15-6.6 commit SHA (leave default to match your device)'
         required: false
         default: '004a97f76e10'
   push:
@@ -23,19 +23,19 @@ jobs:
       - name: Fast toolchain setup (ubuntu-24.04 has clang-18)
         run: |
           clang --version | head -1
-          sudo apt-get install -y -qq --no-install-recommends llvm-18-tools 2>/dev/null | tail -2
-          sudo apt-get install -y -qq --no-install-recommends lld-18 2>/dev/null | tail -2
+          sudo apt-get install -y -qq --no-install-recommends llvm-18-tools lld-18 2>/dev/null | tail -2
           sudo ln -sf "$(command -v ld.lld-18)" /usr/local/bin/ld.lld
           ld.lld --version | head -1
-          export CC=clang-18   # 【关键】显式指定 clang-18，锁定 GKI 6.6 编译环境
+          export CC=clang-18   # 【关键】明确指定 clang-18，防止 make 使用系统默认旧版 clang
 
-      - name: Fetch AOSP common android15-6.6 kernel
+      - name: Fetch AOSP common android15-6.6 kernel (匹配你的设备内核)
         timeout-minutes: 10
         run: |
           git clone --depth 1 --branch android15-6.6 https://android.googlesource.com/kernel/common "$HOME/kernel" \
             || git clone https://android.googlesource.com/kernel/common "$HOME/kernel"
           cd "$HOME/kernel"
           SHA="${{ github.event.inputs.kernel_sha || '004a97f76e10' }}"
+          # 仅当提供了有效 SHA 且仓库不包含该提交时才尝试拉取
           if [ -n "$SHA" ] && ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
             git fetch --depth 1 origin "$SHA" 2>/dev/null || true
           fi
@@ -44,22 +44,24 @@ jobs:
           fi
           echo "KERNEL_COMMIT=$(git rev-parse HEAD)"
 
-      - name: Prepare kernel (defconfig + scripts + modules_prepare)
+      - name: Prepare kernel (defconfig + scripts + modules_prepare)  ← 【关键修复点】
         timeout-minutes: 15
         run: |
           cd "$HOME/kernel"
           export ARCH=arm64
+          # 1. 加载 GKI 默认配置（确保 CONFIG_KPROBES 等符号存在）
           make LLVM=1 LLVM_IAS=1 gki_defconfig
-          scripts/config --enable CONFIG_KPROBES --enable CONFIG_KALLSYMS --enable CONFIG_KALLSYMS_ALL 2>/dev/null || true
-          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" scripts 2>/dev/null
-          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare 2>/dev/null
+          # 2. 【必跑】显式生成 scripts 所需的头文件和 make 依赖（此步常被 cache 做标记从而导致 exit code 2）
+          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" scripts
+          # 3. 为外部模块链接做准备（必须在 scripts 之后）
+          make LLVM=1 LLVM_IAS=1 -j"$(nproc)" modules_prepare
           echo "=== kernel ready for external modules ==="
 
       - name: Build smaps_hide.ko
         timeout-minutes: 10
         run: |
           cd "$GITHUB_WORKSPACE"
-          make ARCH=arm64 LLVM=1 -C "$HOME/kernel" M="$PWD" modules 2>/dev/null
+          make ARCH=arm64 LLVM=1 -C "$HOME/kernel" M="$PWD" modules
           echo "--- artifacts ---"
           ls -la *.ko
           strings smaps_hide.ko | grep -m1 vermagic || true

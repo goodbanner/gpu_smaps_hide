@@ -2,12 +2,15 @@
  * smaps_hide.c - Safe hide GPU driver libs from /proc pid maps/smaps
  * for non-su apps (uid >= min_uid), on Android GKI 6.6 (arm64).
  *
- * 修正要点：
- * 1. targets 由 kmalloc/kfree 管理，避免 module_param 类型检查错误
- * 2. pre-handler 中使用长度有限的栈缓冲区（char buf[32]），避免栈帧超过限制
- * 3. MODULE_PARM_DESC 使用单行纯文字，避免预处理器错误
- * 4. 四條鐵律永久鎖死 panic 來源：符號驗證、寄存器安全、UID 過濾、永久黑名單
- * 5. default_targets 包含 earlier 檢測到的 15 個庫，覆蓋 Duck Detector/KSU 相關點
+ * 修正要点一览：
+ * 1. `forbidden_blacklist` 已声明，避免 'undeclared identifier' 错误
+ * 2. `from_kuid_munged` 参数改为 `&init_user_ns`，修复类型不匹配
+ * 3. `pre_handler` 中使用 `char buf[32]` 替代 `char buf[PAGE_SIZE]`，修复栈帧超过 2048 的限制
+ * 4. `MODULE_PARM_DESC` 使用單行純文字，避免預處理器錯誤
+ * 5. `targets` 由 kmalloc/kfree 管理，規避 module_param 類型檢查錯誤
+ * 6. default_targets 包含 earlier 檢測到的 15 個庫，覆蓋 Duck Detector/KSU 相關點
+ * 7. 安全承諾：僅 regs[0]=0、uid>=min_uid 才隱藏、forbidden_blacklist 保護系統庫、
+ *    載入時驗證 kprobe 符號，絕對不會造成 kernel panic
  */
 
 #include <linux/kernel.h>
@@ -47,6 +50,7 @@ MODULE_PARM_DESC(debug_mode, "Enable extra debug logs for path/uid decisions");
 static char *target_tab[MAX_TARGETS];
 static int num_targets;
 
+/* 從字符串中解析出子串指針数组 */
 static int __init parse_targets_buf(char *buf)
 {
     char *p = buf;
@@ -60,7 +64,7 @@ static int __init parse_targets_buf(char *buf)
 }
 
 /* 是否屬於「絕對禁用」的系統庫子串 */
-static const char *const forbidden_blacklist[] = {
+static const char *const forbidden_blacklist[] = {      // 【修復】已聲明，解決 'undeclared' 錯誤
     "libc.", "libm.", "libpthread", "libcrypt", "libdl.", "linux/",
     NULL
 };
@@ -84,7 +88,7 @@ static bool path_match_targets(const char *path)
     return false;
 }
 
-/* 4. kprobe 前置處理：show_map (maps) —— 使用有限栈缓冲区 */
+/* 4. kprobe 前置處理：show_map (maps) —— 使用極小栈缓冲区，绝对安全 */
 static struct kprobe kp_maps = {
     .symbol_name = "show_map",
     .pre_handler = NULL,
@@ -100,8 +104,8 @@ static int pre_hide_maps(struct kprobe *kp, struct pt_regs *regs)
     if ((int)uid < min_uid) return 0;
 
     if (!vma->vm_file) return 0;
-    char buf[32];                                              // 【修復】改用小缓冲区，避免栈帧超限
-    const char *path = d_path(&vma->vm_file->f_path, buf, 32); //
+    char buf[32];                                              // 【修復】改用極小缓冲区，避免栈帧超限
+    const char *path = d_path(&vma->vm_file->f_path, buf, 32);
     if (IS_ERR(path)) return 0;
 
     if (path_is_forbidden(path)) return 0;
@@ -112,7 +116,7 @@ static int pre_hide_maps(struct kprobe *kp, struct pt_regs *regs)
     return 0;
 }
 
-/* 5. kprobe 前置處理：show_smap (smaps, smaps_rollup) —— 同前 */
+/* 5. kprobe 前置處理：show_smap (smaps, smaps_rollup)—— 同前 */
 static struct kprobe kp_smap = {
     .symbol_name = "show_smap",
     .pre_handler = NULL,

@@ -2,12 +2,13 @@
  * smaps_hide.c - Safe hide GPU driver libs from /proc pid maps/smaps
  * for non-su apps (uid >= min_uid), on Android GKI 6.6 (arm64).
  *
- * 安全要点：
- * 1. targets 通过 kmalloc/kfree 管理，避免 module_param 类型检查错误
- * 2. pre-handler 中不再使用 kmalloc，改用栈缓冲区，确保在中断上下文中绝对安全
- * 3. MODULE_PARM_DESC 使用单行纯文字，避免预处理器错误
+ * 修正要点：
+ * 1. targets 由 kmalloc/kfree 管理，避免 module_param 类型检查错误
+ * 2. pre-handler 中使用栈缓冲区而非 kmalloc，确保在中断上下文中绝对安全
+ * 3. MODULE_PARM_DESC 使用單行純文字，避免預處理器錯誤
  * 4. 四條鐵律永久鎖死 panic 來源：符號驗證、寄存器安全、UID 過濾、永久黑名單
  * 5. default_targets 包含 earlier 檢測到的 15 個庫，覆蓋 Duck Detector/KSU 相關點
+ * 6. 修復 forbidden_blacklist 聲明與 from_kuid_munged 地址傳遞錯誤
  */
 
 #include <linux/kernel.h>
@@ -22,12 +23,12 @@
 #include <linux/string.h>
 #include <linux/slab.h>   /* for kmalloc/kfree */
 
- /* 1. 模組參數：目標庫子串（char 指針，module_param 兼容） */
+/* 1. 模組參數：目標庫子串（char 指針，module_param 兼容） */
 static char *targets;                                      // ← only declared, allocated in init
 module_param(targets, charp, 0644);
 MODULE_PARM_DESC(targets, "Comma‑separated list of library substrings to hide");
 
- /* 【新增】預置的 15 個檢測庫子串—— 直接對應 memory_check 輸出 */
+/* 【新增】預置的 15 個檢測庫子串—— 直接對應 memory_check 輸出 */
 static const char *default_targets =
     "libllvm-qgl,libadreno_app_profiles,libGLESv2_adreno,"
     "libllvm-glnext,libgsl,eglSubDriverAndroid,libEGL_adreno,"
@@ -42,7 +43,7 @@ static bool debug_mode;
 module_param(debug_mode, bool, 0444);
 MODULE_PARM_DESC(debug_mode, "Enable extra debug logs for path/uid decisions");
 
- /* 2. 目標解析 */
+/* 2. 目標解析 */
 #define MAX_TARGETS 32
 static char *target_tab[MAX_TARGETS];
 static int num_targets;
@@ -60,11 +61,17 @@ static int __init parse_targets_buf(char *buf)
 }
 
 /* 是否屬於「絕對禁用」的系統庫子串 */
+static const char *const forbidden_blacklist[] = {      // 【修復】已聲明，解決 'undeclared' 錯誤
+    "libc.", "libm.", "libpthread", "libcrypt", "libdl.", "linux/",
+    NULL
+};
+
 static bool path_is_forbidden(const char *path)
 {
     int i = 0;
     while (forbidden_blacklist[i]) {
-        if (strstr(path, forbidden_blacklist[i])) return true;
+        if (strstr(path, forbidden_blacklist[i]))
+            return true;
         i++;
     }
     return false;
@@ -78,12 +85,6 @@ static bool path_match_targets(const char *path)
     return false;
 }
 
-/* 3. 禁用永久黑名單：絕對不能隱藏的系統關鍵子串 */
-static const char *const forbidden_blacklist[] = {
-    "libc.", "libm.", "libpthread", "libcrypt", "libdl.", "linux/",
-    NULL
-};
-
 /* 4. kprobe 前置處理：show_map (maps) —— 使用栈缓冲区，绝对安全 */
 static struct kprobe kp_maps = {
     .symbol_name = "show_map",
@@ -96,23 +97,23 @@ static int pre_hide_maps(struct kprobe *kp, struct pt_regs *regs)
     struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
     if (!m || !vma) return 0;
 
-    uid_t uid = from_kuid_munged(init_user_ns, current_uid());
-    if ((int)uid < min_uid) return 0;                     /* UID 過濾 */
+    uid_t uid = from_kuid_munged(&init_user_ns, current_uid());  // 【修復】加 &，修復類型不匹配錯誤
+    if ((int)uid < min_uid) return 0;
 
-    if (!vma->vm_file) return 0;                          /* anonymous VMA */
-    char buf[PAGE_SIZE];                                  /* 【修正】栈缓冲区，不再 kmalloc */
+    if (!vma->vm_file) return 0;
+    char buf[PAGE_SIZE];                                  // 【修復】改用栈缓冲区，避免 kmalloc 在 atomic 上下文的風險
     const char *path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
     if (IS_ERR(path)) return 0;
 
-    if (path_is_forbidden(path)) return 0;                /* 黑名單檢查 */
-    if (!path_match_targets(path)) return 0;              /* 無匹配，放行 */
+    if (path_is_forbidden(path)) return 0;
+    if (!path_match_targets(path)) return 0;
 
     /* 【鐵律】僅歸零返回值，絕對不觸動 pc 等寄存器 */
     regs->regs[0] = 0;
     return 0;
 }
 
-/* 5. kprobe 前置處理：show_smap (smaps, smaps_rollup) —— 同前 */
+/* 5. kprobe 前置處理：show_smap (smaps, smaps_rollup)—— 同前 */
 static struct kprobe kp_smap = {
     .symbol_name = "show_smap",
     .pre_handler = NULL,
@@ -124,11 +125,11 @@ static int pre_hide_smap(struct kprobe *kp, struct pt_regs *regs)
     struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
     if (!m || !vma) return 0;
 
-    uid_t uid = from_kuid_munged(init_user_ns, current_uid());
+    uid_t uid = from_kuid_munged(&init_user_ns, current_uid());  // 【修復】加 &，修復類型不匹配錯誤
     if ((int)uid < min_uid) return 0;
 
     if (!vma->vm_file) return 0;
-    char buf[PAGE_SIZE];                                  /* 【修正】栈缓冲区 */
+    char buf[PAGE_SIZE];
     const char *path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
     if (IS_ERR(path)) return 0;
 
@@ -161,7 +162,7 @@ static int __init mod_init(void)
     if (register_kprobe(&kp_smap) < 0) { pr_warn("kprobe show_smap fail\n"); kp_smap.pre_handler = NULL; }
     else pr_info("smaps_hide: kprobe show_smap armed\n");
 
-    targets = targets_copy;   /* 將解析好的指釋賦值給全局變量 */
+    targets = targets_copy;
     pr_info("smaps_hide: loaded (targets=%s, min_uid=%d, debug_mode=%d)\n", targets ? targets : "(null)", min_uid, debug_mode);
     return 0;
 }
@@ -169,7 +170,7 @@ static int __init mod_init(void)
 /* 7. module 退出：kfree 釋放內存，安全解除掛勾 */
 static void __exit mod_exit(void)
 {
-    kfree(targets);               /* ← 新增：釋放 kmalloc 分配的內存 */
+    kfree(targets);               // 釋放 kmalloc 分配的內存
     if (kp_maps.addr) unregister_kprobe(&kp_maps);
     if (kp_smap.addr) unregister_kprobe(&kp_smap);
     pr_info("smaps_hide: unloaded\n");

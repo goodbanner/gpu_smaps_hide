@@ -4,11 +4,10 @@
  *
  * 修正要点：
  * 1. targets 由 kmalloc/kfree 管理，避免 module_param 类型检查错误
- * 2. pre-handler 中使用栈缓冲区而非 kmalloc，确保在中断上下文中绝对安全
- * 3. MODULE_PARM_DESC 使用單行純文字，避免預處理器錯誤
+ * 2. pre-handler 中使用长度有限的栈缓冲区（char buf[32]），避免栈帧超过限制
+ * 3. MODULE_PARM_DESC 使用单行纯文字，避免预处理器错误
  * 4. 四條鐵律永久鎖死 panic 來源：符號驗證、寄存器安全、UID 過濾、永久黑名單
  * 5. default_targets 包含 earlier 檢測到的 15 個庫，覆蓋 Duck Detector/KSU 相關點
- * 6. 修復 forbidden_blacklist 聲明與 from_kuid_munged 地址傳遞錯誤
  */
 
 #include <linux/kernel.h>
@@ -61,7 +60,7 @@ static int __init parse_targets_buf(char *buf)
 }
 
 /* 是否屬於「絕對禁用」的系統庫子串 */
-static const char *const forbidden_blacklist[] = {      // 【修復】已聲明，解決 'undeclared' 錯誤
+static const char *const forbidden_blacklist[] = {
     "libc.", "libm.", "libpthread", "libcrypt", "libdl.", "linux/",
     NULL
 };
@@ -85,7 +84,7 @@ static bool path_match_targets(const char *path)
     return false;
 }
 
-/* 4. kprobe 前置處理：show_map (maps) —— 使用栈缓冲区，绝对安全 */
+/* 4. kprobe 前置處理：show_map (maps) —— 使用有限栈缓冲区 */
 static struct kprobe kp_maps = {
     .symbol_name = "show_map",
     .pre_handler = NULL,
@@ -101,8 +100,8 @@ static int pre_hide_maps(struct kprobe *kp, struct pt_regs *regs)
     if ((int)uid < min_uid) return 0;
 
     if (!vma->vm_file) return 0;
-    char buf[PAGE_SIZE];                                  // 【修復】改用栈缓冲区，避免 kmalloc 在 atomic 上下文的風險
-    const char *path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
+    char buf[32];                                              // 【修復】改用小缓冲区，避免栈帧超限
+    const char *path = d_path(&vma->vm_file->f_path, buf, 32); //
     if (IS_ERR(path)) return 0;
 
     if (path_is_forbidden(path)) return 0;
@@ -113,7 +112,7 @@ static int pre_hide_maps(struct kprobe *kp, struct pt_regs *regs)
     return 0;
 }
 
-/* 5. kprobe 前置處理：show_smap (smaps, smaps_rollup)—— 同前 */
+/* 5. kprobe 前置處理：show_smap (smaps, smaps_rollup) —— 同前 */
 static struct kprobe kp_smap = {
     .symbol_name = "show_smap",
     .pre_handler = NULL,
@@ -129,8 +128,8 @@ static int pre_hide_smap(struct kprobe *kp, struct pt_regs *regs)
     if ((int)uid < min_uid) return 0;
 
     if (!vma->vm_file) return 0;
-    char buf[PAGE_SIZE];
-    const char *path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
+    char buf[32];                                              // 【修復】改用小缓冲区
+    const char *path = d_path(&vma->vm_file->f_path, buf, 32);
     if (IS_ERR(path)) return 0;
 
     if (path_is_forbidden(path)) return 0;
@@ -150,7 +149,7 @@ static int __init mod_init(void)
 
     num_targets = parse_targets_buf(targets_copy);
     if (num_targets == 0) { pr_err("empty targets\n"); kfree(targets_copy); return -EINVAL; }
-    pr_info("smaps_hide: parsed %d target(s)\n", num_targets);
+    pr_info("smaps_hide: parsed %d target(s) from parameters\n", num_targets);
 
     /* --- maps kprobe --- */
     kp_maps.pre_handler = pre_hide_maps;

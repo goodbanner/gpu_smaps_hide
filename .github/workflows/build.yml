@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_sha:
-        description: 'Kernel source commit SHA. Default 004a97f76e10 is verified against this device (/proc/version: 6.6.147-android15-8-g004a97f76e10-...-4k). Leave default to match device.'
+        description: 'Kernel source commit SHA (full 40-char, or abbreviated). Default 004a97f76e10 is verified against this device (/proc/version: 6.6.147-android15-8-g004a97f76e10-...-4k). Leave default to match device.'
         required: false
         default: '004a97f76e10'
   push:
@@ -37,21 +37,28 @@ jobs:
       # 必须构建在与设备一致的内核源码 commit 上，否则 task_struct / pt_regs /
       # kretprobe_instance 等结构体布局不同，kretprobe 处理函数会解引用错误地址
       # 导致 insmod -f 后瞬间 panic / 重启。
+      #
+      # 注意：004a97f76e10 只是 git describe 的缩写 SHA，不能用 “git fetch origin <缩写>”
+      # 去取（会被当成引用名，远端没有该分支而报错）。正确做法是克隆 android15-6.6
+      # 分支（其历史包含该 commit），再在本地用 git rev-parse 展开后 checkout。
       - name: Fetch AOSP common android15-6.6 kernel at exact device commit
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
-          git clone --filter=blob:none --no-checkout \
+          git clone --filter=blob:none --branch android15-6.6 --no-checkout \
             https://android.googlesource.com/kernel/common "$HOME/kernel"
           cd "$HOME/kernel"
           SHA="${{ github.event.inputs.kernel_sha || '004a97f76e10' }}"
-          # 拉取目标 commit（即便它不是分支 tip，Googlesource 也允许按 SHA 取）
-          git fetch --tags origin "$SHA" 2>/dev/null || git fetch origin "$SHA"
-          git checkout -q "$SHA"
-          # 校验：必须真的停在目标 commit，否则直接失败（不要再静默落到分支 tip）
-          ACTUAL="$(git rev-parse HEAD)"
-          echo "KERNEL_COMMIT=$ACTUAL"
-          if [ "$ACTUAL" != "$SHA" ]; then
-            echo "ERROR: checked out $ACTUAL, expected $SHA"
+          # 在本地把缩写 SHA 展开为完整 40 字符；对象已在分支历史中，可解析
+          FULL="$(git rev-parse --verify "${SHA}^{commit}" 2>/dev/null || true)"
+          if [ -z "$FULL" ]; then
+            echo "ERROR: commit $SHA not found in android15-6.6 history"
+            exit 1
+          fi
+          git checkout -q "$FULL"
+          echo "KERNEL_COMMIT=$FULL"
+          # 校验：必须真的停在目标 commit，否则直接失败
+          if [ "$(git rev-parse HEAD)" != "$FULL" ]; then
+            echo "ERROR: checked out $(git rev-parse HEAD), expected $FULL"
             exit 1
           fi
 

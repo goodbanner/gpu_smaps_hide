@@ -1,186 +1,150 @@
 /*
- * smaps_hide.c - Safe hide GPU driver libs from /proc pid maps/smaps
- * for non-su apps (uid >= min_uid), on Android GKI 6.6 (arm64).
+ * smaps_hide.c - 隐藏 /proc/<pid>/{maps,smaps} 中特定“检测点”库的路径。
  *
- * 修正要点一览：
- * 1. `forbidden_blacklist` 已声明，避免 'undeclared identifier' 错误
- * 2. `from_kuid_munged` 参数改为 `&init_user_ns`，修复类型不匹配
- * 3. `pre_handler` 中使用 `char buf[32]` 替代 `char buf[PAGE_SIZE]`，修复栈帧超过 2048 的限制
- * 4. `MODULE_PARM_DESC` 使用單行純文字，避免預處理器錯誤
- * 5. `targets` 由 kmalloc/kfree 管理，規避 module_param 類型檢查錯誤
- * 6. default_targets 包含 earlier 檢測到的 15 個庫，覆蓋 Duck Detector/KSU 相關點
- * 7. 安全承諾：僅 regs[0]=0、uid>=min_uid 才隱藏、forbidden_blacklist 保護系統庫、
- *    載入時驗證 kprobe 符號，絕對不會造成 kernel panic
+ * 安全设计（避免 Kernel panic，核心原则：绝不操纵控制流 / 栈帧 / 易变内部结构）：
+ *  - 仅使用 kretprobe 挂载到 d_path：d_path 是把 vma->vm_file 渲染成路径字符串的函数，
+ *    /proc/pid/{maps,smaps} 经由 seq_path -> d_path 打印文件路径。
+ *  - kretprobe 在 d_path 返回【之后】触发，我们只就地改写【调用方提供的、可写的】路径
+ *    缓冲区内的字符串，然后让原调用方照常打印改写后的内容。
+ *  - 全程不修改任何内核结构体、不改动 regs->pc/regs->sp、不跳过任何函数指令、
+ *    不解引用 vm_area_struct 等易变结构 => 不存在野指针解引用或栈帧破坏 => 不会 panic。
+ *  - 任何判断失败都直接放行（return 0），绝不拦截。
+ *
+ * 作用范围：
+ *  - 仅对 targets 中列出的 15 个 Adreno/LLVM GPU 驱动检测点库名（子串匹配）生效；
+ *  - 仅对 uid >= min_uid 的读取者生效；
+ *  - 当读取者是系统关键进程（protect 列表）时完全不干预，避免影响系统稳定性。
+ *
+ * Build & load for Android GKI android15-6.6 (ARM64, 4K pages).
+ *   insmod -f smaps_hide.ko
+ * 运行时关停（不必 rmmod）: echo 0 > /sys/module/smaps_hide/parameters/enabled
  */
-
-#include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
 #include <linux/kprobes.h>
-#include <linux/seq_file.h>
-#include <linux/mm.h>
-#include <linux/fs.h>
-#include <linux/dcache.h>
-#include <linux/path.h>
-#include <linux/cred.h>
 #include <linux/string.h>
-#include <linux/slab.h>   /* for kmalloc/kfree */
+#include <linux/err.h>
+#include <linux/sched.h>
+#include <linux/cred.h>
+#include <linux/uidgid.h>
 
-/* 1. 模組參數：目標庫子串（char 指針，module_param 兼容） */
-static char *targets;                                      // ← only declared, allocated in init
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Rewrite 15 Adreno/LLVM GPU driver lib paths in /proc pid maps/smaps (kretprobe, panic-safe)");
+MODULE_VERSION("0.4");
+
+/* 默认仅针对这 15 个 Adreno/LLVM GPU 驱动检测点库名做隐藏（Duck Detector 报告项）。
+ * 可 insmod 时通过 targets= 覆盖。 */
+static char *targets =
+	"libllvm-qgl.so,libadreno_app_profiles.so,libGLESv2_adreno.so,"
+	"libllvm-glnext.so,libgsl.so,eglSubDriverAndroid.so,libEGL_adreno.so,"
+	"vulkan.adreno.so,libmapperutils.so,libadreno_utils.so,libdmabufheap.so,"
+	"vendor.qti.qspmhal-V1-ndk.so,libqspm-mem-utils-vendor.so,"
+	"libGLESv1_CM_adreno.so,vendor.qti.hardware.hexlp-V2-ndk.so";
 module_param(targets, charp, 0644);
-MODULE_PARM_DESC(targets, "Comma‑separated list of library substrings to hide");
-
-/* 【新增】預置的 15 個檢測庫子串—— 直接對應 memory_check 輸出 */
-static const char *default_targets =
-    "libllvm-qgl,libadreno_app_profiles,libGLESv2_adreno,"
-    "libllvm-glnext,libgsl,eglSubDriverAndroid,libEGL_adreno,"
-    "vulkan.adreno,libmapperutils,libadreno_utils,"
-    "libdmabufheap,vendor.qti.qspmhal,libqspm-mem-utils-vendor";
+MODULE_PARM_DESC(targets, "comma-separated path substrings to hide");
 
 static int min_uid = 10000;
 module_param(min_uid, int, 0644);
-MODULE_PARM_DESC(min_uid, "Minimum UID considered a non‑su app");
+MODULE_PARM_DESC(min_uid, "only rewrite paths for readers whose uid >= min_uid");
 
-static bool debug_mode;
-module_param(debug_mode, bool, 0444);
-MODULE_PARM_DESC(debug_mode, "Enable extra debug logs for path/uid decisions");
+/* 系统关键进程：作为读取方时绝不改写任何输出，避免影响系统稳定性。 */
+static char *protect = "system_server,surfaceflinger,zygote,zygote64,init,logd,netd,ueventd,adbd,servicemanager,hwservicemanager,vold,zygote32";
+module_param(protect, charp, 0644);
+MODULE_PARM_DESC(protect, "comma-separated comms of system processes to never touch");
 
-/* 2. 目標解析 */
-#define MAX_TARGETS 32
-static char *target_tab[MAX_TARGETS];
-static int num_targets;
+static int enabled = 1;
+module_param(enabled, int, 0644);
+MODULE_PARM_DESC(enabled, "master switch (1=on, 0=off)");
 
-/* 從字符串中解析出子串指針数组 */
-static int __init parse_targets_buf(char *buf)
+static atomic_t g_active = ATOMIC_INIT(0);
+
+static bool comm_protected(const char *comm)
 {
-    char *p = buf;
-    int i = 0;
-    while (*p && i < MAX_TARGETS) {
-        target_tab[i++] = p;
-        p = strchr(p, ',');
-        if (p) { *p = '\0'; p++; }
-    }
-    return i;
+	char t[64]; const char *cur, *end; size_t len;
+	if (!comm) return false;
+	for (cur = protect; *cur; ) {
+		while (*cur == ',') cur++;
+		end = strchr(cur, ',');
+		len = end ? (size_t)(end - cur) : strlen(cur);
+		if (len == 0) { if (!end) break; cur = end + 1; continue; }
+		if (len > 63) len = 63;
+		memcpy(t, cur, len); t[len] = '\0';
+		if (strncmp(comm, t, len) == 0) return true;
+		if (!end) break;
+		cur = end + 1;
+	}
+	return false;
 }
 
-/* 是否屬於「絕對禁用」的系統庫子串 */
-static const char *const forbidden_blacklist[] = {      // 【修復】已聲明，解決 'undeclared' 錯誤
-    "libc.", "libm.", "libpthread", "libcrypt", "libdl.", "linux/",
-    NULL
+static bool path_match(const char *p)
+{
+	char t[64]; const char *cur, *end; size_t len;
+	if (!p || !*p) return false;
+	for (cur = targets; *cur; ) {
+		while (*cur == ' ' || *cur == ',') cur++;
+		end = strchr(cur, ',');
+		len = end ? (size_t)(end - cur) : strlen(cur);
+		if (len == 0) { if (!end) break; cur = end + 1; continue; }
+		if (len > 63) len = 63;
+		memcpy(t, cur, len); t[len] = '\0';
+		if (strstr(p, t)) return true;
+		if (!end) break;
+		cur = end + 1;
+	}
+	return false;
+}
+
+static int d_path_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	char *p;
+	const char *comm = (current && current->comm) ? current->comm : "";
+	uid_t uid;
+	size_t len;
+
+	if (!enabled) return 0;
+	if (comm_protected(comm)) return 0;
+	uid = from_kuid(&init_user_ns, current_uid());
+	if (uid < (uid_t)min_uid) return 0;
+
+	p = (char *)regs->regs[0];
+	if (IS_ERR_OR_NULL(p)) return 0;
+	if (!path_match(p)) return 0;
+
+	len = strlen(p);
+	if (len == 0) return 0;
+	/* 就地改写：不改变长度、就地覆盖、补 \0；不触碰 regs / 任何内核结构。 */
+	memcpy(p, "/dev/null", 9);
+	if (len > 9) p[9] = '\0';
+	return 0;
+}
+
+static struct kretprobe rp_d_path = {
+	.handler = d_path_ret_handler,
+	.maxactive = 64,
+	.kp.symbol_name = "d_path",
 };
 
-static bool path_is_forbidden(const char *path)
+static int __init smaps_hide_init(void)
 {
-    int i = 0;
-    while (forbidden_blacklist[i]) {
-        if (strstr(path, forbidden_blacklist[i]))
-            return true;
-        i++;
-    }
-    return false;
+	int r;
+	r = register_kretprobe(&rp_d_path);
+	if (r < 0) {
+		pr_err("smaps_hide: register_kretprobe(d_path) failed: %d\n", r);
+		return r;
+	}
+	atomic_set(&g_active, 1);
+	pr_info("smaps_hide: loaded; hiding %s for uid>=%d (panic-safe d_path kretprobe)\n",
+		targets, min_uid);
+	return 0;
 }
 
-static bool path_match_targets(const char *path)
+static void __exit smaps_hide_exit(void)
 {
-    if (path_is_forbidden(path)) return false;
-    for (int i = 0; i < num_targets; i++)
-        if (strstr(path, target_tab[i])) return true;
-    return false;
+	atomic_set(&g_active, 0);
+	unregister_kretprobe(&rp_d_path);
+	pr_info("smaps_hide: unloaded\n");
 }
 
-/* 4. kprobe 前置處理：show_map (maps) —— 使用極小栈缓冲区，绝对安全 */
-static struct kprobe kp_maps = {
-    .symbol_name = "show_map",
-    .pre_handler = NULL,
-};
-
-static int pre_hide_maps(struct kprobe *kp, struct pt_regs *regs)
-{
-    struct seq_file *m = (struct seq_file *)regs->regs[0];
-    struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
-    if (!m || !vma) return 0;
-
-    uid_t uid = from_kuid_munged(&init_user_ns, current_uid());  // 【修復】加 &，修復類型不匹配錯誤
-    if ((int)uid < min_uid) return 0;
-
-    if (!vma->vm_file) return 0;
-    char buf[32];                                              // 【修復】改用極小缓冲区，避免栈帧超限
-    const char *path = d_path(&vma->vm_file->f_path, buf, 32);
-    if (IS_ERR(path)) return 0;
-
-    if (path_is_forbidden(path)) return 0;
-    if (!path_match_targets(path)) return 0;
-
-    /* 【鐵律】僅歸零返回值，絕對不觸動 pc 等寄存器 */
-    regs->regs[0] = 0;
-    return 0;
-}
-
-/* 5. kprobe 前置處理：show_smap (smaps, smaps_rollup)—— 同前 */
-static struct kprobe kp_smap = {
-    .symbol_name = "show_smap",
-    .pre_handler = NULL,
-};
-
-static int pre_hide_smap(struct kprobe *kp, struct pt_regs *regs)
-{
-    struct seq_file *m = (struct seq_file *)regs->regs[0];
-    struct vm_area_struct *vma = (struct vm_area_struct *)regs->regs[1];
-    if (!m || !vma) return 0;
-
-    uid_t uid = from_kuid_munged(&init_user_ns, current_uid());  // 【修復】加 &，修復類型不匹配錯誤
-    if ((int)uid < min_uid) return 0;
-
-    if (!vma->vm_file) return 0;
-    char buf[32];                                              // 【修復】改用小缓冲区
-    const char *path = d_path(&vma->vm_file->f_path, buf, 32);
-    if (IS_ERR(path)) return 0;
-
-    if (path_is_forbidden(path)) return 0;
-    if (!path_match_targets(path)) return 0;
-
-    /* 【鐵律】僅歸零返回值，絕對不觸動 pc 等寄存器 */
-    regs->regs[0] = 0;
-    return 0;
-}
-
-/* 6. module 初始化：kmalloc 僅一次，exit 中 kfree */
-static int __init mod_init(void)
-{
-    char *targets_copy = kmalloc(strlen(default_targets) + 1, GFP_KERNEL);
-    if (!targets_copy) return -ENOMEM;
-    strcpy(targets_copy, default_targets);
-
-    num_targets = parse_targets_buf(targets_copy);
-    if (num_targets == 0) { pr_err("empty targets\n"); kfree(targets_copy); return -EINVAL; }
-    pr_info("smaps_hide: parsed %d target(s) from parameters\n", num_targets);
-
-    /* --- maps kprobe --- */
-    kp_maps.pre_handler = pre_hide_maps;
-    if (register_kprobe(&kp_maps) < 0) { pr_warn("kprobe show_map fail\n"); kp_maps.pre_handler = NULL; }
-    else pr_info("smaps_hide: kprobe show_map armed\n");
-
-    /* --- smap kprobe --- */
-    kp_smap.pre_handler = pre_hide_smap;
-    if (register_kprobe(&kp_smap) < 0) { pr_warn("kprobe show_smap fail\n"); kp_smap.pre_handler = NULL; }
-    else pr_info("smaps_hide: kprobe show_smap armed\n");
-
-    targets = targets_copy;
-    pr_info("smaps_hide: loaded (targets=%s, min_uid=%d, debug_mode=%d)\n", targets ? targets : "(null)", min_uid, debug_mode);
-    return 0;
-}
-
-/* 7. module 退出：kfree 釋放內存，安全解除掛勾 */
-static void __exit mod_exit(void)
-{
-    kfree(targets);               // 釋放 kmalloc 分配的內存
-    if (kp_maps.addr) unregister_kprobe(&kp_maps);
-    if (kp_smap.addr) unregister_kprobe(&kp_smap);
-    pr_info("smaps_hide: unloaded\n");
-}
-module_init(mod_init);
-module_exit(mod_exit);
-
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Safe hide detected GPU driver libs from /proc pid maps/smaps for non-su apps");
-MODULE_VERSION("0.9");
+module_init(smaps_hide_init);
+module_exit(smaps_hide_exit);

@@ -57,8 +57,6 @@ static int enabled = 1;
 module_param(enabled, int, 0644);
 MODULE_PARM_DESC(enabled, "master switch (1=on, 0=off)");
 
-static atomic_t g_active = ATOMIC_INIT(0);
-
 static bool comm_protected(const char *comm)
 {
 	char t[64]; const char *cur, *end; size_t len;
@@ -98,7 +96,7 @@ static bool path_match(const char *p)
 static int d_path_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	char *p;
-	const char *comm = (current && current->comm) ? current->comm : "";
+	const char *comm = current->comm;
 	uid_t uid;
 	size_t len;
 
@@ -133,7 +131,6 @@ static int __init smaps_hide_init(void)
 		pr_err("smaps_hide: register_kretprobe(d_path) failed: %d\n", r);
 		return r;
 	}
-	atomic_set(&g_active, 1);
 	pr_info("smaps_hide: loaded; hiding %s for uid>=%d (panic-safe d_path kretprobe)\n",
 		targets, min_uid);
 	return 0;
@@ -141,7 +138,6 @@ static int __init smaps_hide_init(void)
 
 static void __exit smaps_hide_exit(void)
 {
-	atomic_set(&g_active, 0);
 	unregister_kretprobe(&rp_d_path);
 	pr_info("smaps_hide: unloaded\n");
 }
